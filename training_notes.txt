@@ -1,0 +1,150 @@
+Training Notes -- AudioGPT2 on EMoDB
+=====================================
+
+Dataset: EMoDB, 816 samples, 7 emotion classes
+Split: speaker-independent (train: speakers 11-16 -> 493 samples, val: 09/10 -> 161, test: 03/08 -> 162)
+Architecture: GPT-2 (frozen) + cross-attention fusion blocks that inject audio embeddings at intermediate layers
+
+
+---
+
+Run 1 -- First attempt
+----------------------
+Config: 30 epochs, lr=1e-4, 12 fusion blocks at every GPT-2 layer, adapter_dim=256, dropout=0.1
+Trainable params: 33M
+
+Results:
+  Best checkpoint: epoch 4
+  Test accuracy:   21.6%
+  Weighted F1:     13.1%
+
+Confusion matrix (rows=true, cols=pred):
+  Labels: anger, boredom, disgust, fear, happiness, neutral, sadness
+
+            ang  bor  dis  fea  hap  neu  sad
+  anger   [  9    2    0    3    0    0   13 ]
+  boredom [  0    0    0    0    0    0   20 ]
+  disgust [  0    0    0    0    0    0   21 ]
+  fear    [ 11    6    0    2    0    0    7 ]
+  happy   [  5    5    0    0    0    0   12 ]
+  neutral [  0    1    0    0    0    0   20 ]
+  sadness [  0    1    0    0    0    0   24 ]
+
+What happened:
+The model basically gave up and predicted "sadness" for almost everything. Looking at the confusion
+matrix, around 72% of all test samples got classified as sadness regardless of the true label.
+
+The root cause was a massive overfitting problem. 33M trainable parameters on only 493 training
+samples is way too many. Train loss collapsed to ~0.001 by epoch 20 while val loss blew up to 3.4+.
+The best checkpoint was already at epoch 4, after which the model just memorized the training set.
+
+On top of that, the learning rate (1e-4) was too high for this dataset size, which caused the loss
+to crash fast rather than converge properly.
+
+
+---
+
+Run 2 -- Fixing overfitting
+----------------------------
+Changes from Run 1:
+- Reduced fusion blocks from 12 to 4 (applied at GPT-2 layers 2, 5, 8, 11 instead of all 12)
+- Reduced adapter_dim from 256 to 64
+- Increased dropout from 0.1 to 0.3
+- Lowered learning rate from 1e-4 to 1e-5
+- Added class-weighted cross entropy loss (computed from training split labels)
+Trainable params: 10M
+
+Results:
+  Best checkpoint: epoch 30
+  Test accuracy:   35.8%
+  Weighted F1:     28.7%
+
+Train/val loss at best checkpoint (epoch 30): train=1.8834, val=1.8860 -- almost no gap, good.
+
+Confusion matrix (rows=true, cols=pred):
+  Labels: anger, boredom, disgust, fear, happiness, neutral, sadness
+
+            ang  bor  dis  fea  hap  neu  sad
+  anger   [  9    0    0    9    0    7    2 ]
+  boredom [  0    0    1    0    0   12    7 ]
+  disgust [  0    0    1    1    0   11    8 ]
+  fear    [  1    0    0   20    0    4    1 ]
+  happy   [  2    0    1   13    0    4    2 ]
+  neutral [  0    0    0    4    0   15    2 ]
+  sadness [  0    0    0    2    0   10   13 ]
+
+What happened:
+Big improvement. The class collapse was gone and all 7 emotions were appearing in the predictions.
+The overfitting was fixed too -- train and val loss stayed very close to each other the entire run
+(both around 1.88-1.89).
+
+The issue now was that the best checkpoint was the very last epoch, meaning the model was still
+actively learning when we stopped. 30 epochs just wasn't enough.
+
+
+---
+
+Run 3 -- More training time
+-----------------------------
+Changes from Run 2:
+- Increased epochs from 30 to 150 (same architecture and hyperparameters otherwise)
+
+Results:
+  Best checkpoint: epoch 81
+  Test accuracy:   49.4%
+  Weighted F1:     46.8%
+
+Train/val loss at best checkpoint (epoch 81): train=0.6642, val=1.4204 -- gap is opening up,
+overfitting starts here. After this the val loss goes back up while train keeps falling.
+
+Confusion matrix (rows=true, cols=pred):
+  Labels: anger, boredom, disgust, fear, happiness, neutral, sadness
+
+            ang  bor  dis  fea  hap  neu  sad
+  anger   [ 18    0    3    2    2    0    2 ]
+  boredom [  0    7    5    0    0    3    5 ]
+  disgust [  1    4    9    0    0    0    7 ]
+  fear    [  9    0    1   11    2    0    3 ]
+  happy   [ 12    0    1    5    2    2    0 ]
+  neutral [  0    4    1    2    2   12    0 ]
+  sadness [  0    0    1    0    0    3   21 ]
+
+Per-class accuracy at best checkpoint:
+  Sadness:   21/25 = 84%
+  Anger:     18/27 = 67%
+  Neutral:   12/21 = 57%
+  Disgust:    9/21 = 43%
+  Fear:      11/26 = 42%
+  Boredom:    7/20 = 35%
+  Happiness:  2/22 = 9%
+
+What happened:
+Another big jump. The confusion matrix looks much healthier now with no dominant predicted class.
+Sadness and anger are learned well, neutral is decent, and the others are still mediocre but at
+least being predicted.
+
+The main problem left is happiness. 12 out of 22 happiness samples got classified as anger.
+This is a known issue with EMoDB -- both are high-arousal emotions with similar pitch and energy
+in German speech, so they are acoustically hard to separate.
+
+Also worth noting: overfitting started around epoch 81. After that, train loss kept falling
+(0.66 -> 0.40) while val loss went up (1.42 -> 1.72). So the last 69 epochs were basically wasted.
+Next run should stop around 100 epochs.
+
+
+---
+
+Summary table
+--------------
+
+Run | Params | Epochs | Best epoch | Test acc | Weighted F1
+  1 |   33M  |   30   |      4     |  21.6%   |   13.1%
+  2 |   10M  |   30   |     30     |  35.8%   |   28.7%
+  3 |   10M  |  150   |     81     |  49.4%   |   46.8%
+
+Config for next run: epochs=100 (already updated in train_base_model.py)
+
+Open issues:
+- Happiness vs anger confusion (acoustic ambiguity, hard to fix without better features or more data)
+- Speaker-independent baseline for comparison (literature reports ~65-75% for SVM, ~75-85% for DL)
+- 49% is below standard baselines but this is a novel architecture and only week 1
