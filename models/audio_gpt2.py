@@ -10,7 +10,7 @@ _FUSION_INDICES = {2, 5, 8, 11}
 
 
 class AudioGPT2(nn.Module):
-    def __init__(self, num_classes=7, adapter_dim=64, dropout=0.3):
+    def __init__(self, num_classes=7, audio_dim=768, adapter_dim=64, dropout=0.3):
         super().__init__()
 
         self.gpt2 = GPT2Model.from_pretrained("gpt2")
@@ -21,7 +21,7 @@ class AudioGPT2(nn.Module):
         self.fusion_blocks = nn.ModuleList([
             AudioLLMFusionBlock(
                 text_dim=768,
-                audio_dim=768,
+                audio_dim=audio_dim,
                 adapter_dim=adapter_dim,
                 dropout=dropout,
             )

@@ -30,11 +30,11 @@ CONFIG = {
 }
 
 
-def smoke_test():
+def smoke_test(audio_dim=768):
     input_ids = torch.randint(0, 50256, (2, 32))
-    audio = torch.randn(2, 50, 768)
+    audio = torch.randn(2, 50, audio_dim)
 
-    model = AudioGPT2(num_classes=7, adapter_dim=CONFIG["adapter_dim"], dropout=CONFIG["dropout"])
+    model = AudioGPT2(num_classes=7, audio_dim=audio_dim, adapter_dim=CONFIG["adapter_dim"], dropout=CONFIG["dropout"])
     logits = model(input_ids, audio)
 
     assert logits.shape == (2, 7), f"Expected logits shape (2, 7), got {logits.shape}"
@@ -70,8 +70,10 @@ def train():
     device = CONFIG["device"]
     compressor = AudioCompressor(target_len=CONFIG["target_audio_len"]).to(device)
     num_classes = len(dataset.label2idx)
+    audio_dim = dataset.embeddings[0].shape[-1]
     model = AudioGPT2(
         num_classes=num_classes,
+        audio_dim=audio_dim,
         adapter_dim=CONFIG["adapter_dim"],
         dropout=CONFIG["dropout"],
     ).to(device)

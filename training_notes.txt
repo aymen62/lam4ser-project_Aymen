@@ -134,17 +134,75 @@ Next run should stop around 100 epochs.
 
 ---
 
+Run 4 -- Swapping encoder to WavLM-large
+------------------------------------------
+Changes from Run 3:
+- Replaced encoder from facebook/wav2vec2-base-960h (768-dim) to microsoft/wavlm-large (1024-dim)
+- Added audio_dim parameter to AudioGPT2 (was hardcoded to 768) so the fusion blocks instantiate
+  audio_projection as Linear(1024, 768) instead of Identity -- four blocks x 787K params each
+- epochs reduced from 150 to 100 (run 3 showed overfitting started around epoch 81)
+- All other hyperparameters unchanged (lr=1e-5, adapter_dim=64, dropout=0.3)
+Trainable params: 13.2M (up from 10M, difference is the four audio_projection layers)
+
+Results:
+  Best checkpoint: epoch 33
+  Test accuracy:   88.3%
+  Weighted F1:     88.2%
+
+Train/val loss at best checkpoint (epoch 33): train=0.2852, val=0.6180 -- gap already opening.
+By epoch 100: train=0.004, val=0.883 -- severe overfitting in the second half.
+
+Confusion matrix (rows=true, cols=pred):
+  Labels: anger, boredom, disgust, fear, happiness, neutral, sadness
+
+            ang  bor  dis  fea  hap  neu  sad
+  anger   [ 27    0    0    0    0    0    0 ]
+  boredom [  0   15    2    0    0    0    3 ]
+  disgust [  0    1   18    1    1    0    0 ]
+  fear    [  0    0    0   23    3    0    0 ]
+  happy   [  3    0    0    1   18    0    0 ]
+  neutral [  0    1    0    0    0   20    0 ]
+  sadness [  0    3    0    0    0    0   22 ]
+
+Per-class accuracy at best checkpoint:
+  Anger:     27/27 = 100%
+  Neutral:   20/21 = 95%
+  Disgust:   18/21 = 86%
+  Sadness:   22/25 = 88%
+  Fear:      23/26 = 88%
+  Happiness: 18/22 = 82%
+  Boredom:   15/20 = 75%
+
+What happened:
+Massive jump. The single change was the encoder -- everything else was identical to run 3.
+This confirmed that wav2vec2-base was the bottleneck the whole time, not the architecture or
+the hyperparameters. WavLM-large was pretrained on 94k hours of diverse speech with both masked
+prediction and denoising objectives, which incidentally captures prosodic and paralinguistic
+features that emotion recognition depends on.
+
+The happiness vs anger confusion that plagued runs 1-3 is almost gone. Run 3 had 12 happiness
+samples misclassified as anger; here it's down to 3. WavLM's richer feature space separates
+the two high-arousal emotions that wav2vec2 couldn't distinguish.
+
+Overfitting pattern shifted earlier compared to run 3. Best checkpoint was epoch 33 instead of
+epoch 81, and train loss hit near-zero (0.004) by epoch 100 while val loss climbed from 0.62
+to 0.88. The model has 13.2M trainable parameters on 493 training samples, which is an even
+worse ratio than before because of the added projection layers. The early stopping via best
+checkpoint saved the result; without it the final model would have been much worse.
+
+---
+
 Summary table
 --------------
 
-Run | Params | Epochs | Best epoch | Test acc | Weighted F1
-  1 |   33M  |   30   |      4     |  21.6%   |   13.1%
-  2 |   10M  |   30   |     30     |  35.8%   |   28.7%
-  3 |   10M  |  150   |     81     |  49.4%   |   46.8%
-
-Config for next run: epochs=100 (already updated in train_base_model.py)
+Run | Params | Encoder           | Epochs | Best epoch | Test acc | Weighted F1
+  1 |   33M  | wav2vec2-base     |   30   |      4     |  21.6%   |   13.1%
+  2 |   10M  | wav2vec2-base     |   30   |     30     |  35.8%   |   28.7%
+  3 |   10M  | wav2vec2-base     |  150   |     81     |  49.4%   |   46.8%
+  4 |  13.2M | wavlm-large       |  100   |     33     |  88.3%   |   88.2%
 
 Open issues:
-- Happiness vs anger confusion (acoustic ambiguity, hard to fix without better features or more data)
-- Speaker-independent baseline for comparison (literature reports ~65-75% for SVM, ~75-85% for DL)
-- 49% is below standard baselines but this is a novel architecture and only week 1
+- Architecture vs MLP probe gap (-5.5 points) is a small-data problem; revisit on richer dataset
+- Best checkpoint at epoch 33 out of 100 -- most of the compute was wasted on overfitting
+- Boredom still the weakest class (75%), confused with sadness; low-arousal classes remain hard
+- All results on EMoDB (acted speech, 816 samples) -- numbers will drop on naturalistic data
