@@ -16,10 +16,12 @@ from models.compression.compressor import AudioCompressor
 from models.audio_gpt2 import AudioGPT2
 
 
-def _build_config(encoder: str) -> dict:
+def _build_config(encoder: str, lora_rank: int = 0) -> dict:
+    tag = f"{encoder}_lora{lora_rank}" if lora_rank > 0 else encoder
     os.makedirs("checkpoints", exist_ok=True)
     return {
         "encoder": encoder,
+        "lora_rank": lora_rank,
         "embeddings_path": f"embeddings/{encoder}_embeddings.pt",
         "batch_size": 8,
         "lr": 1e-5,
@@ -30,8 +32,8 @@ def _build_config(encoder: str) -> dict:
         "device": "cuda" if torch.cuda.is_available() else "cpu",
         "val_speakers": ["09", "10"],
         "test_speakers": ["03", "08"],
-        "checkpoint_path": f"checkpoints/{encoder}_best.pt",
-        "loss_curve_path": f"checkpoints/{encoder}_loss_curve.png",
+        "checkpoint_path": f"checkpoints/{tag}_best.pt",
+        "loss_curve_path": f"checkpoints/{tag}_loss_curve.png",
     }
 
 
@@ -40,7 +42,7 @@ def smoke_test(config):
     input_ids = torch.randint(0, 50256, (2, 32))
     audio = torch.randn(2, 50, audio_dim)
 
-    model = AudioGPT2(num_classes=7, audio_dim=audio_dim, adapter_dim=config["adapter_dim"], dropout=config["dropout"])
+    model = AudioGPT2(num_classes=7, audio_dim=audio_dim, adapter_dim=config["adapter_dim"], dropout=config["dropout"], lora_rank=config["lora_rank"])
     logits = model(input_ids, audio)
 
     assert logits.shape == (2, 7), f"Expected logits shape (2, 7), got {logits.shape}"
@@ -82,6 +84,7 @@ def train(config):
         audio_dim=audio_dim,
         adapter_dim=config["adapter_dim"],
         dropout=config["dropout"],
+        lora_rank=config["lora_rank"],
     ).to(device)
 
     train_labels = [dataset[i]["label"].item() for i in train_idx]
@@ -170,6 +173,7 @@ def train(config):
                 {
                     "epoch": epoch,
                     "encoder": config["encoder"],
+                    "lora_rank": config["lora_rank"],
                     "model_state_dict": model.state_dict(),
                     "val_loss": epoch_val_loss,
                     "val_acc": val_acc,
@@ -229,7 +233,13 @@ if __name__ == "__main__":
         choices=["wav2vec2-base", "wav2vec2-large-emotion", "wavlm-large", "hubert-large"],
         help="Which encoder's embeddings to train on",
     )
+    parser.add_argument(
+        "--lora_rank",
+        type=int,
+        default=0,
+        help="LoRA rank for GPT-2 attention layers (0 = disabled)",
+    )
     args = parser.parse_args()
-    config = _build_config(args.encoder)
+    config = _build_config(args.encoder, lora_rank=args.lora_rank)
     smoke_test(config)
     train(config)
