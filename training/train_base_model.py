@@ -16,12 +16,13 @@ from models.compression.compressor import AudioCompressor
 from models.audio_gpt2 import AudioGPT2
 
 
-def _build_config(encoder: str, lora_rank: int = 0) -> dict:
+def _build_config(encoder: str, lora_rank: int = 0, lora_lr: float = 1e-4) -> dict:
     tag = f"{encoder}_lora{lora_rank}" if lora_rank > 0 else encoder
     os.makedirs("checkpoints", exist_ok=True)
     return {
         "encoder": encoder,
         "lora_rank": lora_rank,
+        "lora_lr": lora_lr,
         "embeddings_path": f"embeddings/{encoder}_embeddings.pt",
         "batch_size": 8,
         "lr": 1e-5,
@@ -94,9 +95,16 @@ def train(config):
     criterion = nn.CrossEntropyLoss(weight=torch.tensor(class_weights, dtype=torch.float).to(device))
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(
-        trainable_params, lr=config["lr"], weight_decay=1e-2
-    )
+
+    if config["lora_rank"] > 0:
+        lora_params  = [p for n, p in model.named_parameters() if p.requires_grad and n.endswith((".A", ".B"))]
+        other_params = [p for n, p in model.named_parameters() if p.requires_grad and not n.endswith((".A", ".B"))]
+        optimizer = torch.optim.AdamW([
+            {"params": other_params, "lr": config["lr"]},
+            {"params": lora_params,  "lr": config["lora_lr"]},
+        ], weight_decay=1e-2)
+    else:
+        optimizer = torch.optim.AdamW(trainable_params, lr=config["lr"], weight_decay=1e-2)
 
     epochs = config["epochs"]
     total_steps = epochs * len(train_loader)
@@ -239,7 +247,13 @@ if __name__ == "__main__":
         default=0,
         help="LoRA rank for GPT-2 attention layers (0 = disabled)",
     )
+    parser.add_argument(
+        "--lora_lr",
+        type=float,
+        default=1e-4,
+        help="Learning rate for LoRA parameters",
+    )
     args = parser.parse_args()
-    config = _build_config(args.encoder, lora_rank=args.lora_rank)
+    config = _build_config(args.encoder, lora_rank=args.lora_rank, lora_lr=args.lora_lr)
     smoke_test(config)
     train(config)
