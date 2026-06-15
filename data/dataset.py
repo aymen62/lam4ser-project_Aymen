@@ -121,12 +121,12 @@ class EmoDBFusionDataset(Dataset):
         # ------------------------------------------------------------
         # Build prompt tokens per sample.
         #
-        # Old version:
-        #   one fixed self.input_ids for all samples
         #
-        # New version:
-        #   self.input_ids_list[idx] can be different for each sample,
-        #   especially for acoustic feature prompts.
+        #
+        #
+        #
+        #  self.input_ids_list[idx] can be different for each sample,
+        #  especially for acoustic feature prompts.
         # ------------------------------------------------------------
         self.input_ids_list = []
 
@@ -224,5 +224,30 @@ def speaker_independent_split(dataset, val_speakers=None, test_speakers=None):
         raise ValueError("Val split is empty — check val_speakers argument.")
     if not test_indices:
         raise ValueError("Test split is empty — check test_speakers argument.")
+
+    return train_indices, val_indices, test_indices
+
+
+def aibo_split(dataset):
+    """Split AIBO by school: Ohm=train+val, Mont=test."""
+    train_indices, test_indices = [], []
+
+    for i, spk in enumerate(dataset.speaker_ids):
+        if spk == "Oh":
+            train_indices.append(i)
+        else:  # Mont
+            test_indices.append(i)
+
+    # 10% of Ohm → val
+    torch.manual_seed(42)
+    n_val = int(0.1 * len(train_indices))
+    perm = torch.randperm(len(train_indices)).tolist()
+    val_indices   = [train_indices[i] for i in perm[:n_val]]
+    train_indices = [train_indices[i] for i in perm[n_val:]]
+
+    print("AIBO split summary:")
+    print(f"  Train (Ohm):  {len(train_indices)} samples")
+    print(f"  Val   (Ohm):  {len(val_indices)} samples")
+    print(f"  Test  (Mont): {len(test_indices)} samples")
 
     return train_indices, val_indices, test_indices
