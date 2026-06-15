@@ -17,3 +17,10 @@ loss_curve.png
 
 # SLURM logs
 *.out
+
+# Generated experiment outputs
+checkpoints/
+logs/
+*.out
+*.tar.gz
+*.bak
