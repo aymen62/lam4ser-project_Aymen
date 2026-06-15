@@ -134,33 +134,6 @@ compressor = build_compressor(
 )
 ```
 
-This compressor achieved the best held-out Ohm test weighted F1 and macro F1 in the current comparison.
-
-## Running the compressor comparison
-
-From the project root:
-
-```bash
-python -u training/compare_compressors.py
-```
-
-On the cluster, the Slurm job can be launched with:
-
-```bash
-sbatch gpujob_compare_compressors.sh
-```
-
-The script writes the result table to:
-
-```text
-checkpoints/compressor_comparison/aibo_compressor_results.csv
-```
-
-and saves loss curves under:
-
-```text
-checkpoints/compressor_comparison/
-```
 
 ## Notes
 
