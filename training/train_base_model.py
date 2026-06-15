@@ -13,10 +13,10 @@ from sklearn.metrics import f1_score, confusion_matrix
 from sklearn.utils.class_weight import compute_class_weight
 import matplotlib.pyplot as plt
 
-from data.dataset import EmoDBFusionDataset, speaker_independent_split
+from data.dataset import EmoDBFusionDataset, speaker_independent_split, aibo_split
 from models.compression.compressor import AudioCompressor
 from models.audio_gpt2 import AudioGPT2
-
+from models.compression.compressor import build_compressor
 
 def _build_config(
     encoder: str,
@@ -32,24 +32,24 @@ def _build_config(
     os.makedirs("checkpoints", exist_ok=True)
 
     return {
-        "encoder": encoder,
-        "prompt_type": prompt_type,
-        "max_prompt_length": 64 if "feature" in prompt_type else 32,
-        "lora_rank": lora_rank,
-        "lora_lr": lora_lr,
-        "embeddings_path": f"embeddings/{encoder}_embeddings.pt",
-        "batch_size": 8,
-        "lr": 1e-5,
-        "epochs": 100,
-        "adapter_dim": 64,
-        "dropout": 0.3,
-        "target_audio_len": 50,
-        "device": "cuda" if torch.cuda.is_available() else "cpu",
-        "val_speakers": ["09", "10"],
-        "test_speakers": ["03", "08"],
-        "checkpoint_path": f"checkpoints/{tag}_best.pt",
-        "loss_curve_path": f"checkpoints/{tag}_loss_curve.png",
-    }
+     "encoder": encoder,
+     "prompt_type": prompt_type,
+     "max_prompt_length": 64 if "feature" in prompt_type else 32,
+     "lora_rank": lora_rank,
+     "lora_lr": lora_lr,
+     "embeddings_path": f"embeddings/{encoder}_embeddings.pt",
+     "batch_size": 16,
+     "lr": 5e-6,
+     "epochs": 30,
+     "adapter_dim": 32,
+     "dropout": 0.4,
+     "target_audio_len": 50,
+     "device": "cuda" if torch.cuda.is_available() else "cpu",
+     "val_speakers": ["09", "10"],
+     "test_speakers": ["03", "08"],
+     "checkpoint_path": f"checkpoints/{tag}_best.pt",
+     "loss_curve_path": f"checkpoints/{tag}_loss_curve.png",
+}
 
 
 def smoke_test(config):
@@ -87,12 +87,15 @@ def train(config):
         prompt_type=config["prompt_type"],
         max_length=config["max_prompt_length"],
     )
+    if config["encoder"].startswith("aibo_"):
+       train_idx, val_idx, test_idx = aibo_split(dataset)
+    else:
 
-    train_idx, val_idx, test_idx = speaker_independent_split(
+     train_idx, val_idx, test_idx = speaker_independent_split(
         dataset,
         val_speakers=config["val_speakers"],
         test_speakers=config["test_speakers"],
-    )
+     )
 
     train_loader = DataLoader(
         Subset(dataset, train_idx),
@@ -114,10 +117,13 @@ def train(config):
 
     device = config["device"]
 
-    compressor = AudioCompressor(target_len=config["target_audio_len"]).to(device)
-
     num_classes = len(dataset.label2idx)
     audio_dim = dataset.embeddings[0].shape[-1]
+    compressor = build_compressor(
+      "multiscale",
+      target_len=config["target_audio_len"],
+      hidden_dim=audio_dim
+    ).to(device)
 
     model = AudioGPT2(
         num_classes=num_classes,
@@ -139,7 +145,10 @@ def train(config):
         weight=torch.tensor(class_weights, dtype=torch.float).to(device)
     )
 
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    trainable_params = [
+      p for p in list(model.parameters()) + list(compressor.parameters())
+      if p.requires_grad
+    ]
 
     if config["lora_rank"] > 0:
         lora_params = [
@@ -152,7 +161,9 @@ def train(config):
             p
             for n, p in model.named_parameters()
             if p.requires_grad and not n.endswith((".A", ".B"))
-        ]
+        ]+ [
+            p for p in compressor.parameters() if p.requires_grad
+           ]
 
         optimizer = torch.optim.AdamW(
             [
@@ -266,6 +277,8 @@ def train(config):
                     "idx2label": dataset.idx2label,
                     "label2idx": dataset.label2idx,
                     "config": config,
+                    "compressor_state_dict": compressor.state_dict(),
+                    "compressor_name": "multiscale",
                 },
                 config["checkpoint_path"],
             )
@@ -277,9 +290,15 @@ def train(config):
         map_location=device,
         weights_only=False,
     )
+    
 
     model.load_state_dict(checkpoint["model_state_dict"])
+
+    if "compressor_state_dict" in checkpoint:
+      compressor.load_state_dict(checkpoint["compressor_state_dict"])
+
     model.eval()
+    compressor.eval()
 
     all_preds, all_labels = [], []
 
@@ -337,6 +356,7 @@ if __name__ == "__main__":
         choices=[
             "wav2vec2-base",
             "wav2vec2-large-emotion",
+            "aibo_wav2vec2-large-emotion",
             "wavlm-large",
             "hubert-large",
         ],
