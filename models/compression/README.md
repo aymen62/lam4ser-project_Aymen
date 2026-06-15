@@ -58,7 +58,7 @@ Output: [16, 50, 1024]
 
 depending on the selected compressor.
 
-## What was changed during this work
+## AIBO speech emotion recognition experiments
 
 The compression module was updated and tested as part of the AIBO speech emotion recognition experiments.
 
