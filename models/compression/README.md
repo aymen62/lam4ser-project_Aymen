@@ -124,6 +124,14 @@ The result also shows that a simple non-learnable baseline can be very competiti
 
 For the current AIBO Mont-to-Ohm experiments, `mean` is therefore the recommended default compressor.
 
+
+## Compared to Mont → Ohm
+| Direction  | Winner     | Test Acc | Test W-F1 | Test M-F1 |
+| ---------- | ---------- | -------: | --------: | --------: |
+| Mont → Ohm | mean       |   0.8348 |    0.8257 |    0.4832 |
+| Ohm → Mont | multiscale |   0.7854 |    0.8188 |    0.3797 |
+
+
 ## Current recommended default
 
 ```python
@@ -133,6 +141,7 @@ compressor = build_compressor(
     hidden_dim=audio_dim,
 )
 ```
+
 
 
 ## Notes
