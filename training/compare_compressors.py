@@ -1,6 +1,7 @@
 import os
 import sys
 import csv
+import wave
 import time
 import copy
 import gc
@@ -14,7 +15,7 @@ import torch.nn as nn
 import numpy as np
 from torch.utils.data import DataLoader, Subset
 from transformers import get_linear_schedule_with_warmup
-from sklearn.metrics import f1_score, confusion_matrix
+from sklearn.metrics import f1_score, confusion_matrix, recall_score
 from sklearn.utils.class_weight import compute_class_weight
 import matplotlib.pyplot as plt
 
@@ -39,19 +40,19 @@ CONFIG = {
     "dropout": 0.4,
     "target_len": 50,
 
-    # AIBO Mont→Ohm setting
-    "test_prefix": "Ohm",
+    # Official AIBO Ohm→Mont setting
+    "test_prefix": "Mont",
     "val_fraction": 0.15,
 
     "seed": 42,
     "device": "cuda" if torch.cuda.is_available() else "cpu",
 
-    "checkpoint_dir": "checkpoints/compressor_comparison",
-    "results_csv": "checkpoints/compressor_comparison/aibo_compressor_results.csv",
-    "output_plot": "checkpoints/compressor_comparison/aibo_compressor_loss_curves.png",
+    "checkpoint_dir": "checkpoints/compressor_comparison_official_ohm_to_mont",
+    "results_csv": "checkpoints/compressor_comparison_official_ohm_to_mont/aibo_compressor_results.csv",
+    "output_plot": "checkpoints/compressor_comparison_official_ohm_to_mont/aibo_compressor_loss_curves.png",
 }
 
-# Start safe. Add "conv1d" later if you know it works.
+# Compressors evaluated in the AIBO comparison.
 COMPRESSOR_NAMES = ["mean", "max", "attention", "gated", "multiscale"]
 # COMPRESSOR_NAMES = ["mean", "max", "attention", "conv1d", "gated", "multiscale"]
 
@@ -65,54 +66,88 @@ def set_seed(seed: int):
         torch.cuda.manual_seed_all(seed)
 
 
-def aibo_mont_ohm_split(dataset, test_prefix="Ohm", val_fraction=0.15, seed=42):
-    if dataset.file_paths is None:
-        raise ValueError("AIBO Mont/Ohm split requires file paths in the embeddings file.")
+def aibo_official_ohm_mont_split(dataset):
+    """
+    Official-style AIBO split.
 
-    train_val_indices = []
-    test_indices = []
+    Train: Ohm school, all speakers except the last two
+    Val:   Ohm school, last two speakers
+    Test:  Mont school
+    """
+    if dataset.file_paths is None:
+        raise ValueError("AIBO split requires file paths in the embeddings file.")
+
+    ohm_indices = []
+    mont_indices = []
+    ohm_speaker_to_indices = {}
 
     for i, path in enumerate(dataset.file_paths):
         basename = os.path.basename(path)
+        file_id = os.path.splitext(basename)[0]
 
-        if basename.startswith(test_prefix):
-            test_indices.append(i)
-        else:
-            train_val_indices.append(i)
+        parts = file_id.split("_")
+        if len(parts) < 2:
+            raise ValueError(f"Could not parse AIBO file id: {file_id}")
 
-    if not train_val_indices:
-        raise ValueError("Train/val split is empty.")
-    if not test_indices:
-        raise ValueError("Test split is empty.")
+        school = parts[0]
+        speaker = parts[1]
 
-    generator = torch.Generator().manual_seed(seed)
-    perm = torch.randperm(len(train_val_indices), generator=generator).tolist()
+        if school == "Ohm":
+            ohm_indices.append(i)
 
-    val_size = int(val_fraction * len(train_val_indices))
-    val_positions = set(perm[:val_size])
+            if speaker not in ohm_speaker_to_indices:
+                ohm_speaker_to_indices[speaker] = []
 
-    val_indices = [
-        idx for pos, idx in enumerate(train_val_indices)
-        if pos in val_positions
-    ]
+            ohm_speaker_to_indices[speaker].append(i)
 
-    train_indices = [
-        idx for pos, idx in enumerate(train_val_indices)
-        if pos not in val_positions
-    ]
+        elif school == "Mont":
+            mont_indices.append(i)
 
-    print("AIBO Mont→Ohm split summary:")
-    print(f"  Train/Val source: not {test_prefix}")
-    print(f"  Test source:      {test_prefix}")
+    speakers = sorted(ohm_speaker_to_indices.keys())
+
+    if len(speakers) < 3:
+        raise ValueError(
+            f"Need at least 3 Ohm speakers for official split, got {len(speakers)}."
+        )
+
+    val_speakers = set(speakers[-2:])
+    train_speakers = set(speakers[:-2])
+
+    train_indices = []
+    val_indices = []
+
+    for speaker in train_speakers:
+        train_indices.extend(ohm_speaker_to_indices[speaker])
+
+    for speaker in val_speakers:
+        val_indices.extend(ohm_speaker_to_indices[speaker])
+
+    test_indices = mont_indices
+
+    print("Official-style AIBO split summary:")
+    print("  Train: Ohm speakers except last two")
+    print("  Val:   last two Ohm speakers")
+    print("  Test:  Mont")
+    print(f"  Train speakers: {sorted(train_speakers)}")
+    print(f"  Val speakers:   {sorted(val_speakers)}")
     print(f"  Train: {len(train_indices)}")
     print(f"  Val:   {len(val_indices)}")
     print(f"  Test:  {len(test_indices)}")
     print()
 
+    if not train_indices:
+        raise ValueError("Train split is empty.")
+    if not val_indices:
+        raise ValueError("Val split is empty.")
+    if not test_indices:
+        raise ValueError("Test split is empty.")
+
     return train_indices, val_indices, test_indices
 
 
 def print_label_distribution(dataset, indices, name):
+    from collections import Counter
+
     labels = [dataset[i]["label"].item() for i in indices]
     counts = Counter(labels)
 
@@ -137,25 +172,16 @@ def build_optimizer(model, compressor):
         p for p in compressor.parameters() if p.requires_grad
     ]
 
-    optimizer_groups = []
-
+    groups = []
     if other_params:
-        optimizer_groups.append(
-            {"params": other_params, "lr": CONFIG["lr"]}
-        )
-
+        groups.append({"params": other_params, "lr": CONFIG["lr"]})
     if lora_params:
-        optimizer_groups.append(
-            {"params": lora_params, "lr": CONFIG["lora_lr"]}
-        )
+        groups.append({"params": lora_params, "lr": CONFIG["lora_lr"]})
 
-    optimizer = torch.optim.AdamW(
-        optimizer_groups,
-        weight_decay=1e-2,
-    )
+    optimizer = torch.optim.AdamW(groups, weight_decay=1e-2)
+    trainable = other_params + lora_params
 
-    trainable_params = other_params + lora_params
-    return optimizer, trainable_params
+    return optimizer, trainable
 
 
 def evaluate(model, compressor, loader, criterion):
@@ -174,8 +200,7 @@ def evaluate(model, compressor, loader, criterion):
             audio = batch["audio"].to(device)
             labels = batch["label"].to(device)
 
-            audio_compressed = compressor(audio)
-            logits = model(input_ids, audio_compressed)
+            logits = model(input_ids, compressor(audio))
             loss = criterion(logits, labels)
 
             total_loss += loss.item()
@@ -201,6 +226,13 @@ def evaluate(model, compressor, loader, criterion):
         zero_division=0,
     )
 
+    uar = recall_score(
+        all_labels,
+        all_preds,
+        average="macro",
+        zero_division=0,
+    )
+
     cm = confusion_matrix(all_labels, all_preds)
 
     return {
@@ -208,6 +240,7 @@ def evaluate(model, compressor, loader, criterion):
         "acc": acc,
         "weighted_f1": weighted_f1,
         "macro_f1": macro_f1,
+        "uar": uar,
         "confusion_matrix": cm,
     }
 
@@ -220,12 +253,182 @@ def clone_state_dict_to_cpu(module):
 
 
 def load_state_dict_from_cpu(module, state_dict):
-    device_state = {
+    module.load_state_dict({
         k: v.to(CONFIG["device"])
         for k, v in state_dict.items()
-    }
-    module.load_state_dict(device_state)
+    })
 
+
+def get_audio_duration_seconds(path, embedding=None):
+    try:
+        with wave.open(path, "rb") as f:
+            return f.getnframes() / float(f.getframerate())
+    except Exception:
+        pass
+
+    try:
+        import soundfile as sf
+        info = sf.info(path)
+        return info.frames / float(info.samplerate)
+    except Exception:
+        pass
+
+    try:
+        import torchaudio
+        info = torchaudio.info(path)
+        return info.num_frames / float(info.sample_rate)
+    except Exception:
+        pass
+
+    if embedding is not None:
+        return float(embedding.shape[0]) / 50.0
+
+    return -1.0
+
+
+def duration_bin(seconds):
+    if seconds < 2.0:
+        return "0-2s"
+    if seconds < 4.0:
+        return "2-4s"
+    if seconds < 6.0:
+        return "4-6s"
+    if seconds < 8.0:
+        return "6-8s"
+    return ">8s"
+
+
+def metrics_from_predictions(labels, preds):
+    if len(labels) == 0:
+        return {
+            "samples": 0,
+            "acc": 0.0,
+            "weighted_f1": 0.0,
+            "macro_f1": 0.0,
+            "uar": 0.0,
+        }
+
+    return {
+        "samples": len(labels),
+        "acc": sum(p == y for p, y in zip(preds, labels)) / len(labels),
+        "weighted_f1": f1_score(labels, preds, average="weighted", zero_division=0),
+        "macro_f1": f1_score(labels, preds, average="macro", zero_division=0),
+        "uar": recall_score(labels, preds, average="macro", zero_division=0),
+    }
+
+
+def evaluate_by_duration(model, compressor, dataset, indices):
+    device = CONFIG["device"]
+
+    loader = DataLoader(
+        Subset(dataset, indices),
+        batch_size=CONFIG["batch_size"],
+        shuffle=False,
+    )
+
+    durations = []
+    for idx in indices:
+        path = dataset.file_paths[idx] if dataset.file_paths is not None else ""
+        embedding = dataset.embeddings[idx]
+        durations.append(get_audio_duration_seconds(path, embedding))
+
+    model.eval()
+    compressor.eval()
+
+    all_preds = []
+    all_labels = []
+
+    with torch.no_grad():
+        for batch in loader:
+            input_ids = batch["input_ids"].to(device)
+            audio = batch["audio"].to(device)
+            labels = batch["label"].to(device)
+
+            logits = model(input_ids, compressor(audio))
+            preds = logits.argmax(dim=-1)
+
+            all_preds.extend(preds.cpu().tolist())
+            all_labels.extend(labels.cpu().tolist())
+
+    bins = ["0-2s", "2-4s", "4-6s", "6-8s", ">8s"]
+    grouped = {
+        b: {"labels": [], "preds": [], "durations": []}
+        for b in bins
+    }
+
+    for y, pred, dur in zip(all_labels, all_preds, durations):
+        b = duration_bin(dur)
+        grouped[b]["labels"].append(y)
+        grouped[b]["preds"].append(pred)
+        grouped[b]["durations"].append(dur)
+
+    rows = []
+    for b in bins:
+        labels = grouped[b]["labels"]
+        preds = grouped[b]["preds"]
+        ds = grouped[b]["durations"]
+        m = metrics_from_predictions(labels, preds)
+
+        rows.append({
+            "duration_bin": b,
+            "samples": m["samples"],
+            "avg_duration": sum(ds) / len(ds) if ds else 0.0,
+            "acc": m["acc"],
+            "weighted_f1": m["weighted_f1"],
+            "macro_f1": m["macro_f1"],
+            "uar": m["uar"],
+        })
+
+    return rows
+
+
+def save_duration_results(compressor_name, rows):
+    path = os.path.join(
+        CONFIG["checkpoint_dir"],
+        f"{compressor_name}_duration_results.csv",
+    )
+
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "compressor",
+                "duration_bin",
+                "samples",
+                "avg_duration",
+                "acc",
+                "weighted_f1",
+                "macro_f1",
+                "uar",
+            ],
+        )
+        writer.writeheader()
+
+        for row in rows:
+            out = dict(row)
+            out["compressor"] = compressor_name
+            writer.writerow(out)
+
+    print(f"  [{compressor_name}] Saved duration results to: {path}", flush=True)
+
+
+def print_duration_results(compressor_name, rows):
+    print(f"  [{compressor_name}] Test performance by duration:")
+    print("    Bin    Samples  AvgDur  Acc     W-F1    M-F1    UAR")
+    print("    -------------------------------------------------------")
+
+    for r in rows:
+        print(
+            f"    {r['duration_bin']:<6} "
+            f"{r['samples']:<7} "
+            f"{r['avg_duration']:<7.2f} "
+            f"{r['acc']:<7.4f} "
+            f"{r['weighted_f1']:<7.4f} "
+            f"{r['macro_f1']:<7.4f} "
+            f"{r['uar']:<7.4f}"
+        )
+
+    print()
 
 def run_one(compressor_name, loaders, dataset, class_weights):
     set_seed(CONFIG["seed"])
@@ -276,6 +479,7 @@ def run_one(compressor_name, loaders, dataset, class_weights):
     best_val_acc = 0.0
     best_val_weighted_f1 = -1.0
     best_val_macro_f1 = -1.0
+    best_val_uar = -1.0
 
     best_model_state = None
     best_compressor_state = None
@@ -313,6 +517,7 @@ def run_one(compressor_name, loaders, dataset, class_weights):
         val_acc = val_metrics["acc"]
         val_weighted_f1 = val_metrics["weighted_f1"]
         val_macro_f1 = val_metrics["macro_f1"]
+        val_uar = val_metrics["uar"]
 
         train_losses.append(epoch_train_loss)
         val_losses.append(val_loss)
@@ -325,6 +530,7 @@ def run_one(compressor_name, loaders, dataset, class_weights):
             best_val_acc = val_acc
             best_val_weighted_f1 = val_weighted_f1
             best_val_macro_f1 = val_macro_f1
+            best_val_uar = val_uar
             best_model_state = clone_state_dict_to_cpu(model)
             best_compressor_state = clone_state_dict_to_cpu(compressor)
             epochs_without_improvement = 0
@@ -337,7 +543,7 @@ def run_one(compressor_name, loaders, dataset, class_weights):
             f"val_loss: {val_loss:.4f} | "
             f"val_acc: {val_acc:.4f} | "
             f"val_w_f1: {val_weighted_f1:.4f} | "
-            f"val_m_f1: {val_macro_f1:.4f}"
+            f"val_m_f1: {val_macro_f1:.4f} | val_uar: {val_uar:.4f}"
             + ("  ✓" if improved else ""),
             flush=True,
         )
@@ -366,12 +572,23 @@ def run_one(compressor_name, loaders, dataset, class_weights):
     print(f"    val_acc:      {best_val_acc:.4f}")
     print(f"    val_w_f1:     {best_val_weighted_f1:.4f}")
     print(f"    val_m_f1:     {best_val_macro_f1:.4f}")
+    print(f"    val_uar:      {best_val_uar:.4f}")
 
-    print(f"  [{compressor_name}] Ohm test results:")
+    print(f"  [{compressor_name}] Mont test results:")
     print(f"    test_loss:    {test_metrics['loss']:.4f}")
     print(f"    test_acc:     {test_metrics['acc']:.4f}")
     print(f"    test_w_f1:    {test_metrics['weighted_f1']:.4f}")
     print(f"    test_m_f1:    {test_metrics['macro_f1']:.4f}")
+    print(f"    test_uar:     {test_metrics['uar']:.4f}")
+
+    duration_rows = evaluate_by_duration(
+        model,
+        compressor,
+        dataset,
+        CONFIG["duration_test_indices"],
+    )
+    print_duration_results(compressor_name, duration_rows)
+    save_duration_results(compressor_name, duration_rows)
     print(f"    confusion_matrix:")
     print(test_metrics["confusion_matrix"])
     print()
@@ -383,10 +600,12 @@ def run_one(compressor_name, loaders, dataset, class_weights):
         "val_acc": best_val_acc,
         "val_weighted_f1": best_val_weighted_f1,
         "val_macro_f1": best_val_macro_f1,
+        "val_uar": best_val_uar,
         "test_loss": test_metrics["loss"],
         "test_acc": test_metrics["acc"],
         "test_weighted_f1": test_metrics["weighted_f1"],
         "test_macro_f1": test_metrics["macro_f1"],
+        "test_uar": test_metrics["uar"],
         "elapsed_minutes": elapsed_minutes,
         "train_losses": train_losses,
         "val_losses": val_losses,
@@ -422,10 +641,12 @@ def save_results_csv(results):
         "val_acc",
         "val_weighted_f1",
         "val_macro_f1",
+        "val_uar",
         "test_loss",
         "test_acc",
         "test_weighted_f1",
         "test_macro_f1",
+        "test_uar",
         "elapsed_minutes",
     ]
 
@@ -443,10 +664,12 @@ def save_results_csv(results):
                     "val_acc": r["val_acc"],
                     "val_weighted_f1": r["val_weighted_f1"],
                     "val_macro_f1": r["val_macro_f1"],
+                    "val_uar": r["val_uar"],
                     "test_loss": r["test_loss"],
                     "test_acc": r["test_acc"],
                     "test_weighted_f1": r["test_weighted_f1"],
                     "test_macro_f1": r["test_macro_f1"],
+                    "test_uar": r["test_uar"],
                     "elapsed_minutes": r["elapsed_minutes"],
                 }
             )
@@ -493,7 +716,7 @@ def plot_losses(results):
 
 def main():
     print("=" * 70)
-    print("AIBO COMPRESSOR COMPARISON")
+    print("AIBO COMPRESSOR COMPARISON: OFFICIAL OHM TO MONT SPLIT")
     print("=" * 70)
     print(f"Device:       {CONFIG['device']}")
     print(f"Embeddings:   {CONFIG['embeddings_path']}")
@@ -517,12 +740,8 @@ def main():
         max_length=CONFIG["max_prompt_length"],
     )
 
-    train_idx, val_idx, test_idx = aibo_mont_ohm_split(
-        dataset,
-        test_prefix=CONFIG["test_prefix"],
-        val_fraction=CONFIG["val_fraction"],
-        seed=CONFIG["seed"],
-    )
+    train_idx, val_idx, test_idx = aibo_official_ohm_mont_split(dataset)
+    CONFIG["duration_test_indices"] = test_idx
 
     print_label_distribution(dataset, train_idx, "Train")
     print_label_distribution(dataset, val_idx, "Val")
@@ -580,7 +799,7 @@ def main():
         results.append(result)
 
         ranked_so_far = save_results_csv(results)
-        print("Current ranking by Ohm test weighted F1:")
+        print("Current ranking by Mont test weighted F1:")
         for rank, r in enumerate(ranked_so_far, 1):
             print(
                 f"  {rank}. {r['name']:<12} "
@@ -594,7 +813,7 @@ def main():
 
     print("\n" + "=" * 70)
     print("FINAL COMPRESSOR COMPARISON")
-    print("Ranked by Ohm test weighted F1, then test macro F1")
+    print("Ranked by Mont test weighted F1, then test macro F1")
     print("=" * 70)
 
     header = (
@@ -623,7 +842,7 @@ def main():
             f"{r['test_macro_f1']:<11.4f}"
         )
 
-    print(f"\nWinner by Ohm test weighted F1: {ranked[0]['name'].upper()}")
+    print(f"\nWinner by Mont test weighted F1: {ranked[0]['name'].upper()}")
     print(f"Saved CSV to: {CONFIG['results_csv']}")
 
 
